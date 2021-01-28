@@ -1662,10 +1662,8 @@ func (a *Server) upsertRole(ctx context.Context, role services.Role) error {
 
 func (a *Server) CreateAccessRequest(ctx context.Context, req services.AccessRequest) error {
 	err := services.ValidateAccessRequest(a, req,
-		// if request is in state pending, role expansion must be applied
-		services.ExpandRoles(req.GetState().IsPending()),
-		// always apply system annotations before storing new requests
-		services.ApplySystemAnnotations(true),
+		// if request is in state pending, variable expansion must be applied
+		services.ExpandVars(req.GetState().IsPending()),
 	)
 	if err != nil {
 		return trace.Wrap(err)

@@ -19,6 +19,7 @@ package services
 import (
 	"context"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/parse"
 
@@ -111,6 +112,57 @@ type DynamicAccessExt interface {
 	DeleteAllAccessRequests(ctx context.Context) error
 }
 
+// reviewAuthorContext represents a simplified view of a user
+// resource which represents the author of a review during
+// review theshold filter evaluation.
+type reviewAuthorContext struct {
+	name   string              `json:"name"`
+	roles  []string            `json:"roles"`
+	traits map[string][]string `json:"traits"`
+}
+
+// reviewRequestContext represents a simplified view of an access request
+// resource which represents the request parameters which are in-scope
+// during review threshold filter evaluation.
+type reviewRequestContext struct {
+	roles              []string            `json:"name"`
+	system_annotations map[string][]string `json:"system_annotations"`
+}
+
+// reviewFilterContext is the top-level context used to evaluate
+// review threshold filters.
+type reviewFilterContext struct {
+	reviewer reviewAuthorContext  `json:"reviewer"`
+	request  reviewRequestContext `json:"request"`
+}
+
+// ApplyAccessReview attempts to apply the specified access review to the specified request.
+// If this function returns true, the review triggered a state-transition.
+func ApplyAccessReview(req AccessRequest, rev types.AccessReview, author User) (bool, error) {
+	if rev.Author != author.GetName() {
+		return false, trace.BadParameter("mismatched review author (expected %q, got %q)", rev.Author, author)
+	}
+
+	// create a custom parser context which exposes a simplified view of the review author
+	// and the request for evaluation of review threshold filters.
+	parser, err := NewJSONBoolParser(reviewFilterContext{
+		reviewer: reviewAuthorContext{
+			name:   author.GetName(),
+			roles:  author.GetRoles(),
+			traits: author.GetTraits(),
+		},
+		request: reviewRequestContext{
+			roles:              req.GetOriginalRoles(), // TODO: calculate this based on rtm keys instead
+			system_annotations: req.GetSystemAnnotations(),
+		},
+	})
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	return req.ApplyReview(rev, parser)
+}
+
 // GetAccessRequest is a helper function assists with loading a specific request by ID.
 func GetAccessRequest(ctx context.Context, acc DynamicAccess, reqID string) (AccessRequest, error) {
 	reqs, err := acc.GetAccessRequests(ctx, AccessRequestFilter{
@@ -201,7 +253,7 @@ type RequestValidator struct {
 	user          User
 	requireReason bool
 	opts          struct {
-		expandRoles, annotate bool
+		expandVars bool
 	}
 	Roles struct {
 		Allow, Deny []parse.Matcher
@@ -209,6 +261,8 @@ type RequestValidator struct {
 	Annotations struct {
 		Allow, Deny map[string][]string
 	}
+	Thresholds    []types.AccessReviewThreshold
+	ThresholdSets []types.ThresholdIndexSet
 }
 
 // NewRequestValidator configures a new RequestValidor for the specified user.
@@ -225,7 +279,7 @@ func NewRequestValidator(getter UserAndRoleGetter, username string, opts ...Vali
 	for _, opt := range opts {
 		opt(&m)
 	}
-	if m.opts.annotate {
+	if m.opts.expandVars {
 		// validation process for incoming access requests requires
 		// generating system annotations to be attached to the request
 		// before it is inserted into the backend.
@@ -269,9 +323,9 @@ func (m *RequestValidator) Validate(req AccessRequest) error {
 			return trace.BadParameter("wildcard requests are not permitted in state %s", req.GetState())
 		}
 
-		if !m.opts.expandRoles {
+		if !m.opts.expandVars {
 			// teleport always validates new incoming pending access requests
-			// with ExpandRoles(true). after that, it should be impossible to
+			// with ExpandVars(true). after that, it should be impossible to
 			// add new values to the role list.
 			return trace.BadParameter("unexpected wildcard request (this is a bug)")
 		}
@@ -294,7 +348,20 @@ func (m *RequestValidator) Validate(req AccessRequest) error {
 		}
 	}
 
-	if m.opts.annotate {
+	if m.opts.expandVars {
+		// build the role-threshold mapping.  we currently just use the same
+		// group of index sets for each requested role, but future versions
+		// will build custom index set groups for each role based on which
+		// statically assigned roles permit it.
+		rtm := make(map[string]types.ThresholdIndexSets)
+		for _, role := range req.GetRoles() {
+			rtm[role] = types.ThresholdIndexSets{
+				Sets: m.ThresholdSets,
+			}
+		}
+		req.SetThresholds(m.Thresholds)
+		req.SetRoleThresholdMapping(rtm)
+
 		// incoming requests must have system annotations attached
 		// before being inserted into the backend. this is how the
 		// RBAC system propagates sideband information to plugins.
@@ -343,7 +410,23 @@ func (m *RequestValidator) push(role Role) error {
 		return trace.Wrap(err)
 	}
 
-	if m.opts.annotate {
+	if m.opts.expandVars {
+		// store approval thresholds and build an associated index set. each index set
+		// must have one of its approval conditions met.  since we are adding an index
+		// set for each statically assigned role, we are effectively stating that one
+		// threshold from each statically assigned role must be met. future version of
+		// teleport will be "smarter" with how they construct index sets, allowing us to
+		// remove redundant requirements in a backwards-compatible way.
+		var tset types.ThresholdIndexSet
+		for _, t := range allow.Thresholds {
+			tid, err := m.pushThreshold(t)
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			tset.Indexes = append(tset.Indexes, tid)
+		}
+		m.ThresholdSets = append(m.ThresholdSets, tset)
+
 		// validation process for incoming access requests requires
 		// generating system annotations to be attached to the request
 		// before it is inserted into the backend.
@@ -351,6 +434,24 @@ func (m *RequestValidator) push(role Role) error {
 		insertAnnotations(m.Annotations.Allow, allow, m.user.GetTraits())
 	}
 	return nil
+}
+
+// pushThreshold pushes a threshold to the main threshold list and returns its index
+// as a uint32 for compatibility with grpc types.
+func (m *RequestValidator) pushThreshold(t types.AccessReviewThreshold) (uint32, error) {
+	// maxThresholds is an arbitrary large number that serves as a guard against
+	// odd errors due to casting between int and uint32.  This is probably unnecessary
+	// since we'd likely hit other limitations *well* before wrapping became a concern,
+	// but its best to have explicit guard rails.
+	const maxThresholds = 4096
+
+	if len(m.Thresholds) >= maxThresholds {
+		return 0, trace.LimitExceeded("max review thresholds exceeded (max=%d)", maxThresholds)
+	}
+
+	m.Thresholds = append(m.Thresholds, t)
+
+	return uint32(len(m.Thresholds) - 1), nil
 }
 
 // CanRequestRole checks if a given role can be requested.
@@ -389,19 +490,13 @@ func (m *RequestValidator) SystemAnnotations() map[string][]string {
 
 type ValidateRequestOption func(*RequestValidator)
 
-// ExpandRoles activates expansion of wildcard role lists
-// (`[]string{"*"}`) when true.
-func ExpandRoles(expand bool) ValidateRequestOption {
+// ExpandVars toggles variable expansion during request validation.  Variable expansion
+// includes expanding wildcard requests, setting system annotations, and gathering
+// threshold information.  Variable expansion should be run by the auth server prior
+// to storing an access request for the first time.
+func ExpandVars(expand bool) ValidateRequestOption {
 	return func(v *RequestValidator) {
-		v.opts.expandRoles = expand
-	}
-}
-
-// ApplySystemAnnotations causes system annotations to be computed
-// and attached during validation when true.
-func ApplySystemAnnotations(annotate bool) ValidateRequestOption {
-	return func(v *RequestValidator) {
-		v.opts.annotate = annotate
+		v.opts.expandVars = expand
 	}
 }
 

@@ -1162,7 +1162,36 @@ const RoleSpecV3SchemaDefinitions = `
 				  }
 				}
 			  }
-			}
+			},
+			"thresholds": {
+            "type": "array",
+            "items": { "type": "object" }
+          }
+        }
+      },
+      "review_requests": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "roles": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "claims_to_roles": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "claim": {"type": "string"},
+              "value": {"type": "string"},
+              "roles": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "where": { "type": "string" }
 		  }
 		},
 		"rules": {

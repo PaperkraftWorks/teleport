@@ -303,3 +303,23 @@ func (r *EmptyResource) GetName() string {
 func (r *EmptyResource) GetMetadata() Metadata {
 	return r.Metadata
 }
+
+// NewJSONBoolParser returns a generic parser for boolean expressions based on a
+// json-serializable context.
+func NewJSONBoolParser(ctx interface{}) (predicate.Parser, error) {
+	return predicate.NewParser(predicate.Def{
+		Operators: predicate.Operators{
+			AND: predicate.And,
+			OR:  predicate.Or,
+			NOT: predicate.Not,
+		},
+		Functions: map[string]interface{}{
+			"equals":   predicate.Equals,
+			"contains": predicate.Contains,
+		},
+		GetIdentifier: func(fields []string) (interface{}, error) {
+			return predicate.GetFieldByTag(ctx, teleport.JSON, fields)
+		},
+		GetProperty: GetStringMapValue,
+	})
+}
