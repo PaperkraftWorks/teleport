@@ -242,24 +242,15 @@ func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser)
 	rev.Roles = utils.Deduplicate(rev.Roles)
 	sort.Strings(rev.Roles)
 
-	// ensure that all roles are present in this request (note that we are
-	// checking the rtm rather than the request's role field because that
-	// field may be changed if a subselection is applied).
-	for _, role := range rev.Roles {
-		if _, ok := r.Spec.RoleThresholdMapping[role]; !ok {
-			return false, trace.BadParameter("role %q is not a member of this request", role)
-		}
-	}
-
 	// TODO(fspmarshall): Remove this restriction once role overrides
 	// in reviews are fully supported.
 	if len(rev.Roles) != 0 && len(rev.Roles) != len(r.Spec.RoleThresholdMapping) {
 		return false, trace.NotImplemented("reviews cannot perform role subselection")
 	}
 
-	// results collects the results of checking all relevant thresholds
+	// matches collects the results of checking all relevant thresholds
 	// to see if their filters match this review.
-	results := make(map[uint32]bool)
+	matches := make(map[uint32]bool)
 	var matchCount int
 
 	roles := rev.Roles
@@ -277,7 +268,7 @@ func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser)
 
 		for _, tset := range thresholdSets.Sets {
 			for _, tid := range tset.Indexes {
-				if _, ok := results[tid]; ok {
+				if _, ok := matches[tid]; ok {
 					// already checked this threshold
 					continue
 				}
@@ -292,7 +283,7 @@ func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser)
 					return false, trace.Wrap(err)
 				}
 
-				results[tid] = match
+				matches[tid] = match
 				if match {
 					matchCount++
 				}
@@ -302,7 +293,7 @@ func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser)
 
 	// record a list of all thresholds whose filters match this review.
 	rev.ThresholdIndexes = make([]uint32, 0, matchCount)
-	for tid, matched := range results {
+	for tid, matched := range matches {
 		if matched {
 			rev.ThresholdIndexes = append(rev.ThresholdIndexes, tid)
 		}
@@ -331,9 +322,15 @@ func (r *AccessRequestV3) onReview() (bool, error) {
 	// counts keeps track of the approval and denial counts for all thresholds.
 	counts := make([]struct{ approval, denial uint32 }, len(r.Spec.Thresholds))
 
+	// lastReview stores the most recently processed review.  Because processing
+	// halts once approval is reached, this represents the Nth review where N is
+	// the highest applicable approval threshold.
+	var lastReview AccessReview
+
 	// Iterate through all reviews and aggregate them against `counts`.
 ProcessReviews:
 	for _, rev := range r.Spec.Reviews {
+		lastReview = rev
 		for _, tid := range rev.ThresholdIndexes {
 			idx := int(tid)
 			if len(r.Spec.Thresholds) <= idx {
@@ -353,6 +350,8 @@ ProcessReviews:
 			if counts[i].denial >= t.Deny && t.Deny != 0 {
 				// A single denial threshold has been met, deny entire request
 				r.Spec.State = RequestState_DENIED
+				r.Spec.ResolveReason = lastReview.Reason
+				r.Spec.ResolveAnnotations = lastReview.Annotations
 				return true, nil
 			}
 		}
@@ -402,14 +401,18 @@ ProcessReviews:
 		break ProcessReviews
 	}
 
-	if len(approved) == len(r.Spec.RoleThresholdMapping) {
-		// all roles have hit at least one approval threshold
-		// without hitting any denail thresholds.  Request is approved.
-		r.Spec.State = RequestState_APPROVED
-		return true, nil
+	if len(approved) != len(r.Spec.RoleThresholdMapping) {
+		// at least one role has not hit its approval threshold
+		return false, nil
 	}
 
-	return false, nil
+	r.Spec.State = RequestState_APPROVED
+
+	// resolve reasons and annotations are set only by the final review.
+	r.Spec.ResolveReason = lastReview.Reason
+	r.Spec.ResolveAnnotations = lastReview.Annotations
+
+	return true, nil
 }
 
 // CheckAndSetDefaults validates set values and sets default values
@@ -550,6 +553,23 @@ func (t AccessReviewThreshold) MatchesFilter(parser predicate.Parser) (bool, err
 		return true, nil
 	}
 	ifn, err := parser.Parse(t.Filter)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	fn, ok := ifn.(predicate.BoolPredicate)
+	if !ok {
+		return false, trace.BadParameter("unsupported type: %T", ifn)
+	}
+	return fn(), nil
+}
+
+// MatchesWhere returns true if Where rule matches
+// Empty Where always matches
+func (c AccessReviewConditions) MatchesWhere(parser predicate.Parser) (bool, error) {
+	if c.Where == "" {
+		return true, nil
+	}
+	ifn, err := parser.Parse(c.Where)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}

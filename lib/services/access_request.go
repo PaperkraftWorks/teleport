@@ -26,6 +26,7 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/pborman/uuid"
+	//"github.com/vulcand/predicate"
 )
 
 // RequestIDs is a collection of IDs for privilege escalation requests.
@@ -112,28 +113,48 @@ type DynamicAccessExt interface {
 	DeleteAllAccessRequests(ctx context.Context) error
 }
 
-// reviewAuthorContext represents a simplified view of a user
+// reviewParamsContext is a simplified view of an access review
+// which represents the incoming review during review threshold
+// filter evaluation.
+type reviewParamsContext struct {
+	Reason      string              `json:"reason"`
+	Annotations map[string][]string `json:"annotations"`
+}
+
+// reviewAuthorContext is a simplified view of a user
 // resource which represents the author of a review during
 // review theshold filter evaluation.
 type reviewAuthorContext struct {
-	name   string              `json:"name"`
-	roles  []string            `json:"roles"`
-	traits map[string][]string `json:"traits"`
+	Roles  []string            `json:"roles"`
+	Traits map[string][]string `json:"traits"`
 }
 
-// reviewRequestContext represents a simplified view of an access request
+// reviewRequestContext is a simplified view of an access request
 // resource which represents the request parameters which are in-scope
 // during review threshold filter evaluation.
 type reviewRequestContext struct {
-	roles              []string            `json:"name"`
-	system_annotations map[string][]string `json:"system_annotations"`
+	Roles             []string            `json:"roles"`
+	Reason            string              `json:"reason"`
+	SystemAnnotations map[string][]string `json:"system_annotations"`
 }
 
-// reviewFilterContext is the top-level context used to evaluate
+// thresholdFilterContext is the top-level context used to evaluate
 // review threshold filters.
-type reviewFilterContext struct {
-	reviewer reviewAuthorContext  `json:"reviewer"`
-	request  reviewRequestContext `json:"request"`
+type thresholdFilterContext struct {
+	Reviewer reviewAuthorContext  `json:"reviewer"`
+	Review   reviewParamsContext  `json:"review"`
+	Request  reviewRequestContext `json:"request"`
+}
+
+// reviewPermissionContext is the top-level context used to evaluate
+// a user's review permissions.  It is fuctionally identical to the
+// thresholdFilterContext except that it does not expose review parameters.
+// this is because review permissions are used to determine which requests
+// a user is allowed to see, and therefore needs to be calculable prior
+// to construction of review parameters.
+type reviewPermissionContext struct {
+	Reviewer reviewAuthorContext  `json:"reviewer"`
+	Request  reviewRequestContext `json:"request"`
 }
 
 // ApplyAccessReview attempts to apply the specified access review to the specified request.
@@ -145,15 +166,19 @@ func ApplyAccessReview(req AccessRequest, rev types.AccessReview, author User) (
 
 	// create a custom parser context which exposes a simplified view of the review author
 	// and the request for evaluation of review threshold filters.
-	parser, err := NewJSONBoolParser(reviewFilterContext{
-		reviewer: reviewAuthorContext{
-			name:   author.GetName(),
-			roles:  author.GetRoles(),
-			traits: author.GetTraits(),
+	parser, err := NewJSONBoolParser(thresholdFilterContext{
+		Reviewer: reviewAuthorContext{
+			Roles:  author.GetRoles(),
+			Traits: author.GetTraits(),
 		},
-		request: reviewRequestContext{
-			roles:              req.GetOriginalRoles(), // TODO: calculate this based on rtm keys instead
-			system_annotations: req.GetSystemAnnotations(),
+		Review: reviewParamsContext{
+			Reason:      rev.Reason,
+			Annotations: rev.Annotations,
+		},
+		Request: reviewRequestContext{
+			Roles:             req.GetOriginalRoles(),
+			Reason:            req.GetRequestReason(),
+			SystemAnnotations: req.GetSystemAnnotations(),
 		},
 	})
 	if err != nil {
@@ -178,9 +203,9 @@ func GetAccessRequest(ctx context.Context, acc DynamicAccess, reqID string) (Acc
 }
 
 // GetTraitMappings gets the AccessRequestConditions' claims as a TraitMappingsSet
-func GetTraitMappings(c AccessRequestConditions) TraitMappingSet {
-	tm := make([]TraitMapping, 0, len(c.ClaimsToRoles))
-	for _, mapping := range c.ClaimsToRoles {
+func GetTraitMappings(cms []types.AccessRequestClaimMapping) TraitMappingSet {
+	tm := make([]TraitMapping, 0, len(cms))
+	for _, mapping := range cms {
 		tm = append(tm, TraitMapping{
 			Trait: mapping.Claim,
 			Value: mapping.Value,
@@ -199,9 +224,9 @@ type UserAndRoleGetter interface {
 // appendRoleMatchers constructs all role matchers for a given
 // AccessRequestConditions instance and appends them to the
 // supplied matcher slice.
-func appendRoleMatchers(matchers []parse.Matcher, conditions AccessRequestConditions, traits map[string][]string) ([]parse.Matcher, error) {
+func appendRoleMatchers(matchers []parse.Matcher, roles []string, cms []types.AccessRequestClaimMapping, traits map[string][]string) ([]parse.Matcher, error) {
 	// build matchers for the role list
-	for _, r := range conditions.Roles {
+	for _, r := range roles {
 		m, err := parse.NewMatcher(r)
 		if err != nil {
 			return nil, trace.Wrap(err)
@@ -210,7 +235,7 @@ func appendRoleMatchers(matchers []parse.Matcher, conditions AccessRequestCondit
 	}
 
 	// build matchers for all role mappings
-	ms, err := TraitsToRoleMatchers(GetTraitMappings(conditions), traits)
+	ms, err := TraitsToRoleMatchers(GetTraitMappings(cms), traits)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -240,6 +265,171 @@ func insertAnnotations(annotations map[string][]string, conditions AccessRequest
 
 		annotations[key] = allVals
 	}
+}
+
+// ReviewPermissionChecker is a helper for validating whether or not a user
+// is allowed to review specific access requests.
+type ReviewPermissionChecker struct {
+	user  User
+	Roles struct {
+		// allow/deny mappings sort role matches into lists based on their
+		// constraining predicate (where) expression.
+		Allow, Deny map[string][]parse.Matcher
+	}
+}
+
+// CanReviewRequest checks if the user is allowed to review the specified request.
+// note that the ability to review a request does not necessarily imply that any specific
+// approval/denail thresholds will actually match the user's review.  Matching one or more
+// thresholds is not a pre-requisite for review submission.
+func (c *ReviewPermissionChecker) CanReviewRequest(req AccessRequest) (bool, error) {
+	// user cannot review their own request
+	if c.user.GetName() == req.GetUser() {
+		return false, nil
+	}
+
+	parser, err := NewJSONBoolParser(reviewPermissionContext{
+		Reviewer: reviewAuthorContext{
+			Roles:  c.user.GetRoles(),
+			Traits: c.user.GetTraits(),
+		},
+		Request: reviewRequestContext{
+			Roles:             req.GetOriginalRoles(),
+			Reason:            req.GetRequestReason(),
+			SystemAnnotations: req.GetSystemAnnotations(),
+		},
+	})
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	// method allocates new array if an override has already been
+	// called, so get the role list once in advance.
+	requestedRoles := req.GetOriginalRoles()
+
+	// check all denial rules first.
+	for expr, denyMatchers := range c.Roles.Deny {
+		// if predicate is non-empty, it must match
+		if expr != "" {
+			match, err := parser.EvalBoolPredicate(expr)
+			if err != nil {
+				return false, trace.Wrap(err)
+			}
+			if !match {
+				continue
+			}
+		}
+
+		for _, role := range requestedRoles {
+			for _, deny := range denyMatchers {
+				if deny.Match(role) {
+					// short-circuit on first denial
+					return false, nil
+				}
+			}
+		}
+	}
+
+	// allowed tracks whether or not each role has matched
+	// an allow rule yet.
+	allowed := make([]bool, len(requestedRoles))
+
+	// allAllowed tracks whether or not the current iteration
+	// has seen any roles which have not yet matched an
+	// allow rule.
+	var allAllowed bool
+Outer:
+	for expr, allowMatchers := range c.Roles.Allow {
+		// if predicate is non-empty, it must match.
+		if expr != "" {
+			match, err := parser.EvalBoolPredicate(expr)
+			if err != nil {
+				return false, trace.Wrap(err)
+			}
+			if !match {
+				continue Outer
+			}
+		}
+
+		// set the initial value of allAllowed to true
+		// for this iteration.  If we encounter any roles
+		// which have not yet matched, it will be set back
+		// to false.
+		allAllowed = true
+
+	MatchRoles:
+		for i, role := range requestedRoles {
+			if allowed[i] {
+				continue MatchRoles
+			}
+			for _, allow := range allowMatchers {
+				if allow.Match(role) {
+					allowed[i] = true
+					continue MatchRoles
+				}
+			}
+
+			// since we skip to next iteration on match, getting here
+			// tells us that we have at least one role which has not
+			// matched any allow rules yet.
+			allAllowed = false
+		}
+
+		if allAllowed {
+			// all roles have matched an allow directive, no further
+			// processing is required.
+			break Outer
+		}
+	}
+
+	return allAllowed, nil
+}
+
+func NewReviewPermissionChecker(getter UserAndRoleGetter, username string) (ReviewPermissionChecker, error) {
+	user, err := getter.GetUser(username, false)
+	if err != nil {
+		return ReviewPermissionChecker{}, trace.Wrap(err)
+	}
+
+	c := ReviewPermissionChecker{
+		user: user,
+	}
+
+	c.Roles.Allow = make(map[string][]parse.Matcher)
+	c.Roles.Deny = make(map[string][]parse.Matcher)
+
+	// load all statically assigned roles for the user and
+	// use them to build our checker state.
+	for _, roleName := range c.user.GetRoles() {
+		role, err := getter.GetRole(roleName)
+		if err != nil {
+			return ReviewPermissionChecker{}, trace.Wrap(err)
+		}
+		if err := c.push(role); err != nil {
+			return ReviewPermissionChecker{}, trace.Wrap(err)
+		}
+	}
+
+	return c, nil
+}
+
+func (c *ReviewPermissionChecker) push(role Role) error {
+
+	allow, deny := role.GetAccessReviewConditions(Allow), role.GetAccessReviewConditions(Deny)
+
+	var err error
+
+	c.Roles.Deny[deny.Where], err = appendRoleMatchers(c.Roles.Deny[deny.Where], deny.Roles, deny.ClaimsToRoles, c.user.GetTraits())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	c.Roles.Allow[allow.Where], err = appendRoleMatchers(c.Roles.Allow[allow.Where], allow.Roles, allow.ClaimsToRoles, c.user.GetTraits())
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
 }
 
 // RequestValidator a helper for validating access requests.
@@ -400,12 +590,12 @@ func (m *RequestValidator) push(role Role) error {
 
 	allow, deny := role.GetAccessRequestConditions(Allow), role.GetAccessRequestConditions(Deny)
 
-	m.Roles.Deny, err = appendRoleMatchers(m.Roles.Deny, deny, m.user.GetTraits())
+	m.Roles.Deny, err = appendRoleMatchers(m.Roles.Deny, deny.Roles, deny.ClaimsToRoles, m.user.GetTraits())
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	m.Roles.Allow, err = appendRoleMatchers(m.Roles.Allow, allow, m.user.GetTraits())
+	m.Roles.Allow, err = appendRoleMatchers(m.Roles.Allow, allow.Roles, allow.ClaimsToRoles, m.user.GetTraits())
 	if err != nil {
 		return trace.Wrap(err)
 	}

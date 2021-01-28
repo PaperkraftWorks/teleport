@@ -304,10 +304,35 @@ func (r *EmptyResource) GetMetadata() Metadata {
 	return r.Metadata
 }
 
+// BoolPredicateParser extends predicate.Parser with a convenience method
+// for evaluating bool predicates.
+type BoolPredicateParser interface {
+	predicate.Parser
+	EvalBoolPredicate(string) (bool, error)
+}
+
+type boolPredicateParser struct {
+	predicate.Parser
+}
+
+func (p boolPredicateParser) EvalBoolPredicate(expr string) (bool, error) {
+	ifn, err := p.Parse(expr)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	fn, ok := ifn.(predicate.BoolPredicate)
+	if !ok {
+		return false, trace.BadParameter("unsupported type: %T", ifn)
+	}
+
+	return fn(), nil
+}
+
 // NewJSONBoolParser returns a generic parser for boolean expressions based on a
 // json-serializable context.
-func NewJSONBoolParser(ctx interface{}) (predicate.Parser, error) {
-	return predicate.NewParser(predicate.Def{
+func NewJSONBoolParser(ctx interface{}) (BoolPredicateParser, error) {
+	p, err := predicate.NewParser(predicate.Def{
 		Operators: predicate.Operators{
 			AND: predicate.And,
 			OR:  predicate.Or,
@@ -322,4 +347,8 @@ func NewJSONBoolParser(ctx interface{}) (predicate.Parser, error) {
 		},
 		GetProperty: GetStringMapValue,
 	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return boolPredicateParser{Parser: p}, nil
 }
