@@ -1192,7 +1192,11 @@ const RoleSpecV3SchemaDefinitions = `
 			"thresholds": {
             "type": "array",
             "items": { "type": "object" }
-          }
+          },
+		  "suggested_reviewers": {
+		    "type": "array",
+            "items": { "type": "string" }
+		  }
         }
       },
       "review_requests": {

@@ -19,6 +19,7 @@ package types
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 
@@ -80,6 +81,12 @@ type AccessRequest interface {
 	// ApplyReview applies an access review.  The supplied parser must be pre-configured to evaluate
 	// boolian expressions based on the review and its author.
 	ApplyReview(AccessReview, predicate.Parser) (bool, error)
+	// GetReviews gets the list of currently applied access reviews.
+	GetReviews() []AccessReview
+	// GetSuggestedReviewers gets the suggested reviewer list.
+	GetSuggestedReviewers() []string
+	// SetSuggestedReviewers sets the suggested reviewer list.
+	SetSuggestedReviewers([]string)
 	// CheckAndSetDefaults validates the access request and
 	// supplies default values where appropriate.
 	CheckAndSetDefaults() error
@@ -236,6 +243,13 @@ func (r *AccessRequestV3) SetRoleThresholdMapping(rtm map[string]ThresholdIndexS
 func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser) (bool, error) {
 	if !rev.State.IsApproved() && !rev.State.IsDenied() {
 		return false, trace.BadParameter("invalid state proposal: %s (expected approval/denial)", rev.State)
+	}
+
+	// the default theshold should exist. if it does not, the request either is not fully
+	// initialized (i.e. variable expansion has not been run yet) or the was inserted into
+	// the backend by a teleport instance which does not support the review feature.
+	if len(r.Spec.Thresholds) == 0 {
+		return false, trace.BadParameter("request is uninitialized or does not support reviews")
 	}
 
 	for _, existingReview := range r.Spec.Reviews {
@@ -422,6 +436,21 @@ ProcessReviews:
 	return true, nil
 }
 
+// GetReviews gets the list of currently applied access reviews.
+func (r *AccessRequestV3) GetReviews() []AccessReview {
+	return r.Spec.Reviews
+}
+
+// GetSuggestedReviewers gets the suggested reviewer list.
+func (r *AccessRequestV3) GetSuggestedReviewers() []string {
+	return r.Spec.SuggestedReviewers
+}
+
+// SetSuggestedReviewers sets the suggested reviewer list.
+func (r *AccessRequestV3) SetSuggestedReviewers(reviewers []string) {
+	r.Spec.SuggestedReviewers = reviewers
+}
+
 // CheckAndSetDefaults validates set values and sets default values
 func (r *AccessRequestV3) CheckAndSetDefaults() error {
 	if err := r.Metadata.CheckAndSetDefaults(); err != nil {
@@ -570,10 +599,16 @@ func (t AccessReviewThreshold) MatchesFilter(parser predicate.Parser) (bool, err
 	return fn(), nil
 }
 
-func (t AccessReviewConditions) IsZero() bool {
-	// use the protobuf size helper to check if
-	// this is a zero value.
-	return t.Size() == 0
+func (c AccessReviewThreshold) Equals(other AccessReviewThreshold) bool {
+	return reflect.DeepEqual(c, other)
+}
+
+func (c AccessReviewConditions) IsZero() bool {
+	return c.Size() == 0
+}
+
+func (c AccessRequestConditions) IsZero() bool {
+	return c.Size() == 0
 }
 
 // AccessRequestUpdate encompasses the parameters of a
@@ -804,7 +839,11 @@ const AccessRequestSpecSchema = `{
         "reviews": {
           "type": "array",
           "items": { "type": "object" }
-        }
+        },
+		"suggested_reviewers": {
+		  "type": "array",
+		  "items": { "type": "string" }
+		}
 	}
 }`
 

@@ -472,8 +472,9 @@ type RequestValidator struct {
 	Annotations struct {
 		Allow, Deny map[string][]string
 	}
-	Thresholds    []types.AccessReviewThreshold
-	ThresholdSets []types.ThresholdIndexSet
+	Thresholds         []types.AccessReviewThreshold
+	ThresholdSets      []types.ThresholdIndexSet
+	SuggestedReviewers []string
 }
 
 // NewRequestValidator configures a new RequestValidor for the specified user.
@@ -577,6 +578,12 @@ func (m *RequestValidator) Validate(req AccessRequest) error {
 		// before being inserted into the backend. this is how the
 		// RBAC system propagates sideband information to plugins.
 		req.SetSystemAnnotations(m.SystemAnnotations())
+
+		// if no suggested reviewers were provided by the user then
+		// use the defaults sugested by the user's static roles.
+		if len(req.GetSuggestedReviewers()) == 0 {
+			req.SetSuggestedReviewers(utils.Deduplicate(m.SuggestedReviewers))
+		}
 	}
 	return nil
 }
@@ -628,21 +635,37 @@ func (m *RequestValidator) push(role Role) error {
 		// threshold from each statically assigned role must be met. future version of
 		// teleport will be "smarter" with how they construct index sets, allowing us to
 		// remove redundant requirements in a backwards-compatible way.
-		var tset types.ThresholdIndexSet
-		for _, t := range allow.Thresholds {
-			tid, err := m.pushThreshold(t)
-			if err != nil {
-				return trace.Wrap(err)
+		if !allow.IsZero() {
+			thresholds := allow.Thresholds
+			if len(thresholds) == 0 {
+				// allow directives exist but no thesholds were specified.  insert the
+				// default theshold value.
+				thresholds = []types.AccessReviewThreshold{
+					{
+						Name:    "default",
+						Approve: 1,
+						Deny:    1,
+					},
+				}
 			}
-			tset.Indexes = append(tset.Indexes, tid)
+			var tset types.ThresholdIndexSet
+			for _, t := range allow.Thresholds {
+				tid, err := m.pushThreshold(t)
+				if err != nil {
+					return trace.Wrap(err)
+				}
+				tset.Indexes = append(tset.Indexes, tid)
+			}
+			m.ThresholdSets = append(m.ThresholdSets, tset)
 		}
-		m.ThresholdSets = append(m.ThresholdSets, tset)
 
 		// validation process for incoming access requests requires
 		// generating system annotations to be attached to the request
 		// before it is inserted into the backend.
 		insertAnnotations(m.Annotations.Deny, deny, m.user.GetTraits())
 		insertAnnotations(m.Annotations.Allow, allow, m.user.GetTraits())
+
+		m.SuggestedReviewers = append(m.SuggestedReviewers, allow.SuggestedReviewers...)
 	}
 	return nil
 }
@@ -655,6 +678,13 @@ func (m *RequestValidator) pushThreshold(t types.AccessReviewThreshold) (uint32,
 	// since we'd likely hit other limitations *well* before wrapping became a concern,
 	// but its best to have explicit guard rails.
 	const maxThresholds = 4096
+
+	// don't bother double-storing equivalent thresholds
+	for i, threshold := range m.Thresholds {
+		if t.Equals(threshold) {
+			return uint32(i), nil
+		}
+	}
 
 	if len(m.Thresholds) >= maxThresholds {
 		return 0, trace.LimitExceeded("max review thresholds exceeded (max=%d)", maxThresholds)

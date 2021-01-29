@@ -76,6 +76,21 @@ type CLIConf struct {
 	DesiredRoles string
 	// RequestReason indicates the reason for an access request.
 	RequestReason string
+	// RequestID is an access request ID
+	RequestID string
+	// ReviewReason indicates the reason for an access review.
+	ReviewReason string
+	// ReviewableRequests indicates that only requests which can be reviewed should
+	// be listed.
+	ReviewableRequests bool
+	// SuggestedRequests indicates that only requests which suggest the current user
+	// as a reviewer should be listed.
+	SuggestedRequests bool
+	// MyRequests indicates that only requests created by the current user
+	// should be listed.
+	MyRequests bool
+	// Approve/Deny indicates the desired review kind.
+	Approve, Deny bool
 	// Username is the Teleport user's username (to login into proxies)
 	Username string
 	// Proxy keeps the hostname:port of the SSH proxy to use
@@ -373,6 +388,27 @@ func Run(args []string) {
 	// about the certificate.
 	status := app.Command("status", "Display the list of proxy servers and retrieved certificates")
 
+	req := app.Command("request", "Manage access requests").Alias("requests")
+
+	reqList := req.Command("ls", "List access requests").Alias("list")
+	reqList.Flag("format", "Format output (text, json)").Short('f').Default(teleport.Text).StringVar(&cf.Format)
+	reqList.Flag("reviewable", "Only show requests reviewable by current user").BoolVar(&cf.ReviewableRequests)
+	reqList.Flag("suggested", "Only show requests that suggest current user as reviewer").BoolVar(&cf.SuggestedRequests)
+	reqList.Flag("my-requests", "Only show requests created by current user").BoolVar(&cf.MyRequests)
+
+	reqShow := req.Command("show", "Show request details").Alias("details")
+	reqShow.Arg("request-id", "ID of the target request").Required().StringVar(&cf.RequestID)
+
+	reqCreate := req.Command("create", "Create an access request")
+	reqCreate.Flag("roles", "Roles to be requested").Required().StringVar(&cf.DesiredRoles)
+	reqCreate.Flag("reason", "Reason for requesting").StringVar(&cf.RequestReason)
+
+	reqReview := req.Command("review", "Review an access request")
+	reqReview.Arg("request-id", "ID of target request").Required().StringVar(&cf.RequestID)
+	reqReview.Flag("approve", "Review proposes approval").BoolVar(&cf.Approve)
+	reqReview.Flag("deny", "Review proposes denial").BoolVar(&cf.Deny)
+	reqReview.Flag("reason", "Review reason message").StringVar(&cf.ReviewReason)
+
 	// Kubernetes subcommands.
 	kube := newKubeCommand(app)
 
@@ -465,6 +501,14 @@ func Run(args []string) {
 		onDatabaseEnv(&cf)
 	case dbConfig.FullCommand():
 		onDatabaseConfig(&cf)
+	case reqList.FullCommand():
+		err = onRequestList(&cf)
+	case reqShow.FullCommand():
+		err = onRequestShow(&cf)
+	case reqCreate.FullCommand():
+		err = onRequestCreate(&cf)
+	case reqReview.FullCommand():
+		err = onRequestReview(&cf)
 	default:
 		// This should only happen when there's a missing switch case above.
 		err = trace.BadParameter("command %q not configured", command)
@@ -956,7 +1000,7 @@ func executeAccessRequest(cf *CLIConf) error {
 	if cf.DesiredRoles == "" {
 		return trace.BadParameter("one or more roles must be specified")
 	}
-	roles := strings.Split(cf.DesiredRoles, ",")
+	roles := splitNames(cf.DesiredRoles)
 	tc, err := makeClient(cf, true)
 	if err != nil {
 		return trace.Wrap(err)

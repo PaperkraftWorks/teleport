@@ -781,6 +781,11 @@ message AccessRequestSpecV3 {
     // Reivews is a list of reviews applied to this request (internal use only).
     repeated AccessReview Reviews = 12
         [ (gogoproto.nullable) = false, (gogoproto.jsontag) = "reviews,omitempty" ];
+
+    // SuggestedReviewers is a list of reviewer suggestions.  These can be teleport usernames, but
+    // that is not a requirement.
+    repeated string SuggestedReviewers = 13
+        [ (gogoproto.jsontag) = "suggested_reviewers,omitemtpy" ];
 }
 
 // AccessRequestFilter encodes filter params for access requests.
@@ -1065,6 +1070,11 @@ message AccessRequestConditions {
 
     repeated AccessReviewThreshold Thresholds = 4
         [ (gogoproto.nullable) = false, (gogoproto.jsontag) = "thresholds,omitempty" ];
+
+    // SuggestedReviewers is a list of reviewer suggestions.  These can be teleport usernames, but
+    // that is not a requirement.
+    repeated string SuggestedReviewers = 5
+        [ (gogoproto.jsontag) = "suggested_reviewers,omitempty" ];
 }
 
 // AccessReviewConditions is a matcher for allow/deny restrictions on
