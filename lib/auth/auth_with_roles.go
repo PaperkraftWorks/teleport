@@ -914,13 +914,19 @@ func (a *ServerWithRoles) SubmitAccessReview(ctx context.Context, params types.A
 	if params.Review.Author == "" {
 		params.Review.Author = a.context.User.GetName()
 	}
-	if params.Review.Author != a.context.User.GetName() {
-		return nil, trace.AccessDenied("user %q cannot submit reviews on behalf of %q", a.context.User.GetName(), params.Review.Author)
+
+	// unless the user has the resource-level update permissions, the review author field must match the
+	// user's name.  this is mostly for testing and UI backwards compatibility.  now that we support
+	// granular review permissions, resource-level permissions are effectively deprecated.
+	if a.action(defaults.Namespace, services.KindAccessRequest, services.VerbUpdate, quietAction(true)) != nil {
+		if params.Review.Author != a.context.User.GetName() {
+			return nil, trace.AccessDenied("user %q cannot submit reviews on behalf of %q", a.context.User.GetName(), params.Review.Author)
+		}
 	}
 
 	// MaybeCanReviewRequests returns false positives, but it will tell us
 	// if the user definitely can't reveiw requests, which saves a lot of work.
-	if !a.context.Checker.MaybeCanReviewRequests() {
+	if params.Review.Author == a.context.User.GetName() && !a.context.Checker.MaybeCanReviewRequests() {
 		return nil, trace.AccessDenied("user %q cannot submit reviews", a.context.User.GetName())
 	}
 

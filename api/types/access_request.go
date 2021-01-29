@@ -238,6 +238,12 @@ func (r *AccessRequestV3) ApplyReview(rev AccessReview, parser predicate.Parser)
 		return false, trace.BadParameter("invalid state proposal: %s (expected approval/denial)", rev.State)
 	}
 
+	for _, existingReview := range r.Spec.Reviews {
+		if existingReview.Author == rev.Author {
+			return false, trace.AccessDenied("user %q has already reviewed this request", rev.Author)
+		}
+	}
+
 	// dedupe and sort roles to simplify comparing role lists
 	rev.Roles = utils.Deduplicate(rev.Roles)
 	sort.Strings(rev.Roles)
