@@ -62,8 +62,8 @@ func (r *RequestIDs) IsEmpty() bool {
 	return len(r.AccessRequests) < 1
 }
 
-// DynamicAccess is a service which manages dynamic RBAC.
-type DynamicAccess interface {
+// DynamicAccessCore is the core functionality common to all DynamicAccess implementations.
+type DynamicAccessCore interface {
 	// CreateAccessRequest stores a new access request.
 	CreateAccessRequest(ctx context.Context, req AccessRequest) error
 	// SetAccessRequestState updates the state of an existing access request.
@@ -76,6 +76,14 @@ type DynamicAccess interface {
 	GetPluginData(ctx context.Context, filter PluginDataFilter) ([]PluginData, error)
 	// UpdatePluginData updates a per-resource PluginData entry.
 	UpdatePluginData(ctx context.Context, params PluginDataUpdateParams) error
+}
+
+// DynamicAccess is a service which manages dynamic RBAC.  Specifically, this is the
+// dynamic access interface implemented by remote clients.
+type DynamicAccess interface {
+	DynamicAccessCore
+	// SubmitAccessReview applies a review to a request and returns the post-application state.
+	SubmitAccessReview(ctx context.Context, params types.AccessReviewSubmission) (AccessRequest, error)
 }
 
 // DynamicAccessOracle is a service capable of answering questions related
@@ -106,7 +114,9 @@ func CalculateAccessCapabilities(ctx context.Context, clt UserAndRoleGetter, req
 // DynamicAccessExt is an extended dynamic access interface
 // used to implement some auth server internals.
 type DynamicAccessExt interface {
-	DynamicAccess
+	DynamicAccessCore
+	// ApplyAccessReview applies a review to a request in the backend and returns the post-application state.
+	ApplyAccessReview(ctx context.Context, params types.AccessReviewSubmission, checker ReviewPermissionChecker) (AccessRequest, error)
 	// UpsertAccessRequest creates or updates an access request.
 	UpsertAccessRequest(ctx context.Context, req AccessRequest) error
 	// DeleteAllAccessRequests deletes all existent access requests.
@@ -270,12 +280,23 @@ func insertAnnotations(annotations map[string][]string, conditions AccessRequest
 // ReviewPermissionChecker is a helper for validating whether or not a user
 // is allowed to review specific access requests.
 type ReviewPermissionChecker struct {
-	user  User
+	User  User
 	Roles struct {
 		// allow/deny mappings sort role matches into lists based on their
 		// constraining predicate (where) expression.
 		Allow, Deny map[string][]parse.Matcher
 	}
+}
+
+// HasAllowDirectives checks if any allow directives exist.  A user with
+// no allow directives will never be able to review any requests.
+func (c *ReviewPermissionChecker) HasAllowDirectives() bool {
+	for _, allowMatchers := range c.Roles.Allow {
+		if len(allowMatchers) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // CanReviewRequest checks if the user is allowed to review the specified request.
@@ -284,17 +305,21 @@ type ReviewPermissionChecker struct {
 // thresholds is not a pre-requisite for review submission.
 func (c *ReviewPermissionChecker) CanReviewRequest(req AccessRequest) (bool, error) {
 	// user cannot review their own request
-	if c.user.GetName() == req.GetUser() {
+	if c.User.GetName() == req.GetUser() {
 		return false, nil
 	}
 
+	// method allocates new array if an override has already been
+	// called, so get the role list once in advance.
+	requestedRoles := req.GetOriginalRoles()
+
 	parser, err := NewJSONBoolParser(reviewPermissionContext{
 		Reviewer: reviewAuthorContext{
-			Roles:  c.user.GetRoles(),
-			Traits: c.user.GetTraits(),
+			Roles:  c.User.GetRoles(),
+			Traits: c.User.GetTraits(),
 		},
 		Request: reviewRequestContext{
-			Roles:             req.GetOriginalRoles(),
+			Roles:             requestedRoles,
 			Reason:            req.GetRequestReason(),
 			SystemAnnotations: req.GetSystemAnnotations(),
 		},
@@ -302,10 +327,6 @@ func (c *ReviewPermissionChecker) CanReviewRequest(req AccessRequest) (bool, err
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
-
-	// method allocates new array if an override has already been
-	// called, so get the role list once in advance.
-	requestedRoles := req.GetOriginalRoles()
 
 	// check all denial rules first.
 	for expr, denyMatchers := range c.Roles.Deny {
@@ -392,7 +413,7 @@ func NewReviewPermissionChecker(getter UserAndRoleGetter, username string) (Revi
 	}
 
 	c := ReviewPermissionChecker{
-		user: user,
+		User: user,
 	}
 
 	c.Roles.Allow = make(map[string][]parse.Matcher)
@@ -400,7 +421,7 @@ func NewReviewPermissionChecker(getter UserAndRoleGetter, username string) (Revi
 
 	// load all statically assigned roles for the user and
 	// use them to build our checker state.
-	for _, roleName := range c.user.GetRoles() {
+	for _, roleName := range c.User.GetRoles() {
 		role, err := getter.GetRole(roleName)
 		if err != nil {
 			return ReviewPermissionChecker{}, trace.Wrap(err)
@@ -419,12 +440,12 @@ func (c *ReviewPermissionChecker) push(role Role) error {
 
 	var err error
 
-	c.Roles.Deny[deny.Where], err = appendRoleMatchers(c.Roles.Deny[deny.Where], deny.Roles, deny.ClaimsToRoles, c.user.GetTraits())
+	c.Roles.Deny[deny.Where], err = appendRoleMatchers(c.Roles.Deny[deny.Where], deny.Roles, deny.ClaimsToRoles, c.User.GetTraits())
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	c.Roles.Allow[allow.Where], err = appendRoleMatchers(c.Roles.Allow[allow.Where], allow.Roles, allow.ClaimsToRoles, c.user.GetTraits())
+	c.Roles.Allow[allow.Where], err = appendRoleMatchers(c.Roles.Allow[allow.Where], allow.Roles, allow.ClaimsToRoles, c.User.GetTraits())
 	if err != nil {
 		return trace.Wrap(err)
 	}

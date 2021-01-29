@@ -411,6 +411,7 @@ ProcessReviews:
 	// resolve reasons and annotations are set only by the final review.
 	r.Spec.ResolveReason = lastReview.Reason
 	r.Spec.ResolveAnnotations = lastReview.Annotations
+	r.SetExpiry(r.GetAccessExpiry())
 
 	return true, nil
 }
@@ -563,21 +564,10 @@ func (t AccessReviewThreshold) MatchesFilter(parser predicate.Parser) (bool, err
 	return fn(), nil
 }
 
-// MatchesWhere returns true if Where rule matches
-// Empty Where always matches
-func (c AccessReviewConditions) MatchesWhere(parser predicate.Parser) (bool, error) {
-	if c.Where == "" {
-		return true, nil
-	}
-	ifn, err := parser.Parse(c.Where)
-	if err != nil {
-		return false, trace.Wrap(err)
-	}
-	fn, ok := ifn.(predicate.BoolPredicate)
-	if !ok {
-		return false, trace.BadParameter("unsupported type: %T", ifn)
-	}
-	return fn(), nil
+func (t AccessReviewConditions) IsZero() bool {
+	// use the protobuf size helper to check if
+	// this is a zero value.
+	return t.Size() == 0
 }
 
 // AccessRequestUpdate encompasses the parameters of a

@@ -654,6 +654,7 @@ message AccessReviewThreshold {
     uint32 Deny = 4 [ (gogoproto.jsontag) = "deny,omitempty" ];
 }
 
+// AccessReview is a review to be applied to an access request.
 message AccessReview {
     string Author = 1 [ (gogoproto.jsontag) = "author" ];
     repeated string Roles = 2 [ (gogoproto.jsontag) = "roles,omitempty" ];
@@ -673,6 +674,17 @@ message AccessReview {
     // ThresholdIndexes stores the indexes of thresholds which this review matches
     // (internal use only)
     repeated uint32 ThresholdIndexes = 7 [ (gogoproto.jsontag) = "i,omitempty" ];
+}
+
+// AccessReviewSubmission encodes the necessary parameters for submitting
+// a new access review.
+message AccessReviewSubmission {
+    // RequestID is the unique ID of the request to be reviewed.
+    string RequestID = 1 [ (gogoproto.jsontag) = "id,omitempty" ];
+
+    // Review is the review to be applied.
+    AccessReview Review = 2
+        [ (gogoproto.nullable) = false, (gogoproto.jsontag) = "review,omitempty" ];
 }
 
 // RequestState represents the state of a request for escalated privilege.

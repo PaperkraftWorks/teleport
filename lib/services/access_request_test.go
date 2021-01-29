@@ -92,7 +92,7 @@ func TestThresholdReviewFilter(t *testing.T) {
 			wontParse: []string{
 				`equals(fully.fake.path,"should-fail")`,
 				`fakefunc(reviewer.roles,"some-role")`,
-				`equals("missing-param")`,
+				`equals("too","many","params")`,
 				`contains("missing-param")`,
 				`contains(reviewer.partially.fake.path,"also fails")`,
 				`!`,

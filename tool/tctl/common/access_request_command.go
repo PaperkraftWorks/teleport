@@ -213,7 +213,7 @@ func (c *AccessRequestCommand) Create(client auth.ClientI) error {
 	req.SetRequestReason(c.reason)
 
 	if c.dryRun {
-		err = services.ValidateAccessRequest(client, req, services.ExpandRoles(true), services.ApplySystemAnnotations(true))
+		err = services.ValidateAccessRequest(client, req, services.ExpandVars(true))
 		if err != nil {
 			return trace.Wrap(err)
 		}
